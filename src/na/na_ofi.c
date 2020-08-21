@@ -122,6 +122,9 @@
     X(NA_OFI_PROV_TCP, "tcp;ofi_rxm", "tcp", FI_SOCKADDR_IN, FI_PROGRESS_AUTO, \
         (FI_SOURCE | FI_DIRECTED_RECV),                                        \
         (NA_OFI_WAIT_FD | NA_OFI_NO_SEP | NA_OFI_SKIP_SIGNAL))                 \
+    X(NA_OFI_PROV_PSM, "psm;ofi_rxd", "psm", FI_SOCKADDR_IN, FI_PROGRESS_AUTO, \
+        (FI_SOURCE | FI_DIRECTED_RECV),                                        \
+        (NA_OFI_WAIT_FD | NA_OFI_NO_SEP | NA_OFI_SKIP_SIGNAL))                 \
     X(NA_OFI_PROV_PSM2, "psm2", "", FI_ADDR_PSMX2, FI_PROGRESS_AUTO,           \
         (FI_SOURCE | FI_SOURCE_ERR | FI_DIRECTED_RECV),                        \
         (NA_OFI_DOMAIN_LOCK | NA_OFI_WAIT_FD))                                 \

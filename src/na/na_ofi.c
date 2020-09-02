@@ -1758,13 +1758,14 @@ na_ofi_domain_open(struct na_ofi_class *priv, enum na_ofi_prov_type prov_type,
             na_ofi_domain, GNI_MR_CACHE, &other_reg_type);
         NA_CHECK_NA_ERROR(
             error, ret, "Could not set domain op value for GNI_MR_CACHE");
-
+#if 0
         /* Experiments on Theta showed default value of 2048 too high if
          * launching multiple clients on one node */
         ret = na_ofi_gni_set_domain_op_value(
             na_ofi_domain, GNI_MR_UDREG_REG_LIMIT, &udreg_limit);
         NA_CHECK_NA_ERROR(error, ret,
             "Could not set domain op value for GNI_MR_UDREG_REG_LIMIT");
+#endif
 #    endif
 
         /* Enable lazy deregistration in MR cache */

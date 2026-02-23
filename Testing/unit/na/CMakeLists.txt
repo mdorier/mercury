@@ -58,7 +58,7 @@ macro(add_na_test_comm test_name server client comm protocol)
     # Dynamic client/server test
     add_test(NAME "na_${full_test_name}"
       COMMAND $<TARGET_FILE:mercury_test_driver>
-      --server $<TARGET_FILE:na_test_${server}>
+      --server $<TARGET_FILE:na_test_${server}> ${test_args}
       --client $<TARGET_FILE:na_test_${client}> ${test_args}
     )
   endif()
@@ -83,5 +83,6 @@ build_na_test_lookup(lookup_server)
 # Set list of tests
 
 # Client / server test with all enabled NA plugins
+add_na_test(lookup lookup_server lookup)
 #add_na_test(simple server client)
 #add_na_test(cancel cancel_server cancel_client)

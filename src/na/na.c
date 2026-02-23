@@ -192,6 +192,9 @@ static const struct na_class_ops *const na_plugin_static_g[] = {
     &NA_PLUGIN_OPS(ucx),
 #    endif
 #endif
+#ifdef NA_HAS_LSQUIC
+    &NA_PLUGIN_OPS(quic),
+#endif
 #ifdef NA_HAS_BMI
     &NA_PLUGIN_OPS(bmi),
 #endif

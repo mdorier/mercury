@@ -8,6 +8,7 @@
 
 #include "na_test_common.h"
 
+#include "mercury_test_config.h"
 #include "mercury_thread.h"
 
 /****************/
@@ -183,6 +184,8 @@ main(int argc, char *argv[])
     na_ret = na_test_common_init(argc, argv, true, &info);
     NA_TEST_CHECK_NA_ERROR(error, na_ret, "na_test_common_init() failed (%s)",
         NA_Error_to_string(na_ret));
+
+    HG_TEST_READY_MSG();
 
     progress_threads = (hg_thread_t *) malloc(
         sizeof(*progress_threads) * info.na_test_info.max_classes);

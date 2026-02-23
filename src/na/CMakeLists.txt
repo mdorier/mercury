@@ -325,6 +325,39 @@ if(NA_USE_SM)
   endif()
 endif()
 
+# LSQUIC
+option(NA_USE_LSQUIC "Use lsquic (QUIC) plugin." OFF)
+if(NA_USE_LSQUIC)
+  find_package(lsquic REQUIRED)
+  find_package(OpenSSL REQUIRED)
+  set(NA_PLUGINS ${NA_PLUGINS} quic)
+  set(NA_HAS_LSQUIC 1)
+  find_package(ZLIB REQUIRED)
+  # lsquic's static lib has transitive deps not declared in its cmake config:
+  #   BoringSSL libssl.a contains C++ objects (needs libstdc++),
+  #   lsquic uses cbrt() (needs libm) and zlib for cert compression.
+  set(NA_LSQUIC_INT_LIB_DEPENDENCIES
+    ${NA_LSQUIC_INT_LIB_DEPENDENCIES}
+    lsquic::lsquic
+    OpenSSL::SSL
+    OpenSSL::Crypto
+    ZLIB::ZLIB
+    stdc++
+    m
+  )
+  if(NA_USE_DYNAMIC_PLUGINS)
+    set(NA_DYNAMIC_PLUGINS
+      ${NA_DYNAMIC_PLUGINS}
+      lsquic
+    )
+  else()
+    set(NA_INT_LIB_DEPENDENCIES
+      ${NA_INT_LIB_DEPENDENCIES}
+      ${NA_LSQUIC_INT_LIB_DEPENDENCIES}
+    )
+  endif()
+endif()
+
 # PSM
 option(NA_USE_PSM "Use PSM." OFF)
 if(NA_USE_PSM)

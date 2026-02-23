@@ -27,6 +27,11 @@ if(NA_USE_SM)
   mark_as_advanced(NA_SM_TESTING_PROTOCOL)
 endif()
 
+if(NA_USE_LSQUIC)
+  set(NA_QUIC_TESTING_PROTOCOL "quic" CACHE STRING "Protocol(s) used for testing (e.g., quic).")
+  mark_as_advanced(NA_QUIC_TESTING_PROTOCOL)
+endif()
+
 if(NA_USE_PSM)
   set(NA_PSM_TESTING_PROTOCOL "psm" CACHE STRING "Protocol(s) used for testing (e.g., psm).")
   mark_as_advanced(NA_PSM_TESTING_PROTOCOL)

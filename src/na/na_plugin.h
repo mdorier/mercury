@@ -178,6 +178,9 @@ extern NA_PRIVATE const struct na_class_ops NA_PLUGIN_OPS(ofi);
 extern NA_PRIVATE const struct na_class_ops NA_PLUGIN_OPS(ucx);
 #    endif
 #endif
+#ifdef NA_HAS_LSQUIC
+extern NA_PRIVATE const struct na_class_ops NA_PLUGIN_OPS(quic);
+#endif
 #ifdef NA_HAS_BMI
 extern NA_PRIVATE const struct na_class_ops NA_PLUGIN_OPS(bmi);
 #endif

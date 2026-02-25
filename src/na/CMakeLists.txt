@@ -358,6 +358,30 @@ if(NA_USE_LSQUIC)
   endif()
 endif()
 
+# ZMQ
+option(NA_USE_ZMQ "Use ZMQ plugin." OFF)
+if(NA_USE_ZMQ)
+  find_package(PkgConfig REQUIRED)
+  pkg_check_modules(LIBZMQ REQUIRED IMPORTED_TARGET libzmq>=4.3)
+  set(NA_PLUGINS ${NA_PLUGINS} zmq)
+  set(NA_HAS_ZMQ 1)
+  set(NA_ZMQ_INT_LIB_DEPENDENCIES
+    ${NA_ZMQ_INT_LIB_DEPENDENCIES}
+    PkgConfig::LIBZMQ
+  )
+  if(NA_USE_DYNAMIC_PLUGINS)
+    set(NA_DYNAMIC_PLUGINS
+      ${NA_DYNAMIC_PLUGINS}
+      zmq
+    )
+  else()
+    set(NA_INT_LIB_DEPENDENCIES
+      ${NA_INT_LIB_DEPENDENCIES}
+      ${NA_ZMQ_INT_LIB_DEPENDENCIES}
+    )
+  endif()
+endif()
+
 # PSM
 option(NA_USE_PSM "Use PSM." OFF)
 if(NA_USE_PSM)

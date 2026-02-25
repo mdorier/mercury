@@ -198,6 +198,9 @@ static const struct na_class_ops *const na_plugin_static_g[] = {
 #ifdef NA_HAS_ZMQ
     &NA_PLUGIN_OPS(zmq),
 #endif
+#ifdef NA_HAS_HTTP
+    &NA_PLUGIN_OPS(http),
+#endif
 #ifdef NA_HAS_BMI
     &NA_PLUGIN_OPS(bmi),
 #endif

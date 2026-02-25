@@ -37,6 +37,11 @@ if(NA_USE_ZMQ)
   mark_as_advanced(NA_ZMQ_TESTING_PROTOCOL)
 endif()
 
+if(NA_USE_HTTP)
+  set(NA_HTTP_TESTING_PROTOCOL "http" CACHE STRING "Protocol(s) used for testing (e.g., http).")
+  mark_as_advanced(NA_HTTP_TESTING_PROTOCOL)
+endif()
+
 if(NA_USE_PSM)
   set(NA_PSM_TESTING_PROTOCOL "psm" CACHE STRING "Protocol(s) used for testing (e.g., psm).")
   mark_as_advanced(NA_PSM_TESTING_PROTOCOL)

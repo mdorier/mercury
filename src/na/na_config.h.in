@@ -124,6 +124,9 @@
 /* ZMQ */
 #cmakedefine NA_HAS_ZMQ
 
+/* HTTP */
+#cmakedefine NA_HAS_HTTP
+
 /* PSM */
 #cmakedefine NA_HAS_PSM
 

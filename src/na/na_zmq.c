@@ -2310,20 +2310,17 @@ na_zmq_progress_dealer(struct na_zmq_class *priv,
         }
         zmq_msg_close(&msg_payload);
 
-        /* Read source sockaddr frame */
-        memset(&source_ss, 0, sizeof(source_ss));
+        /* Read source sockaddr frame (consume but ignore — we know
+         * the peer from the DEALER socket we're reading from) */
         zmq_msg_init(&msg_source);
-        rc = zmq_msg_recv(&msg_source, peer->dealer_socket, 0);
-        if (rc >= 0) {
-            size_t src_size = zmq_msg_size(&msg_source);
-            if (src_size == sizeof(struct sockaddr_in) ||
-                src_size == sizeof(struct sockaddr_in6)) {
-                memcpy(&source_ss, zmq_msg_data(&msg_source), src_size);
-            }
-        }
+        zmq_msg_recv(&msg_source, peer->dealer_socket, 0);
         zmq_msg_close(&msg_source);
 
-        na_zmq_dispatch_message(priv, &hdr, &rma_hdr, &source_ss,
+        /* Use the peer's stored address as source. This is the address
+         * we used to connect, which matches what Mercury expects —
+         * the wire frame's source_ss would be the remote's self_addr
+         * which may differ behind NAT. */
+        na_zmq_dispatch_message(priv, &hdr, &rma_hdr, &peer->ss,
             payload_data, payload_size);
     }
 }

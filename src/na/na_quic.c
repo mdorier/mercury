@@ -2337,6 +2337,10 @@ na_lsquic_addr_lookup(
     NA_CHECK_SUBSYS_ERROR(
         addr, addr == NULL, error, ret, NA_NOMEM, "calloc() failed");
 
+    /* Strip optional "quic://" prefix */
+    if (strncmp(name, "quic://", 7) == 0)
+        name += 7;
+
     /* Parse host:port */
     host_copy = strdup(name);
     NA_CHECK_SUBSYS_ERROR(
@@ -2487,7 +2491,7 @@ na_lsquic_addr_to_string(na_class_t NA_UNUSED *na_class, char *buf,
         return NA_SUCCESS;
     }
 
-    needed = (size_t) snprintf(buf, *buf_size, "%s:%s", host, port);
+    needed = (size_t) snprintf(buf, *buf_size, "quic://%s:%s", host, port);
     *buf_size = needed + 1;
 
     return NA_SUCCESS;

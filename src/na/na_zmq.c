@@ -694,8 +694,8 @@ na_zmq_initialize(
     {
         int opt_val;
 
-        /* Don't linger on close */
-        opt_val = 0;
+        /* Allow pending messages to flush on close */
+        opt_val = 1000;
         zmq_setsockopt(priv->zmq_socket, ZMQ_LINGER, &opt_val,
             sizeof(opt_val));
 
@@ -974,6 +974,10 @@ na_zmq_addr_lookup(na_class_t NA_UNUSED *na_class,
     NA_CHECK_SUBSYS_ERROR(
         addr, addr == NULL, error, ret, NA_NOMEM, "calloc() failed");
 
+    /* Strip optional "tcp://" prefix */
+    if (strncmp(name, "tcp://", 6) == 0)
+        name += 6;
+
     /* Parse host:port */
     host_copy = strdup(name);
     NA_CHECK_SUBSYS_ERROR(
@@ -1119,7 +1123,7 @@ na_zmq_addr_to_string(na_class_t NA_UNUSED *na_class, char *buf,
         return NA_SUCCESS;
     }
 
-    needed = (size_t) snprintf(buf, *buf_size, "%s:%s", host, port);
+    needed = (size_t) snprintf(buf, *buf_size, "tcp://%s:%s", host, port);
     *buf_size = needed + 1;
 
     return NA_SUCCESS;

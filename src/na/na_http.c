@@ -958,6 +958,10 @@ na_http_addr_lookup(na_class_t NA_UNUSED *na_class,
     char *host_copy = NULL;
     na_return_t ret;
 
+    /* Strip optional "http://" prefix */
+    if (strncmp(name, "http://", 7) == 0)
+        name += 7;
+
     addr = (struct na_http_addr *) calloc(1, sizeof(*addr));
     NA_CHECK_SUBSYS_ERROR(
         addr, addr == NULL, error, ret, NA_NOMEM, "calloc() failed");
@@ -1107,7 +1111,7 @@ na_http_addr_to_string(na_class_t NA_UNUSED *na_class, char *buf,
         return NA_SUCCESS;
     }
 
-    needed = (size_t) snprintf(buf, *buf_size, "%s:%s", host, port);
+    needed = (size_t) snprintf(buf, *buf_size, "http://%s:%s", host, port);
     *buf_size = needed + 1;
 
     return NA_SUCCESS;

@@ -189,6 +189,7 @@ struct na_http_curl_state {
     struct na_http_class *priv;   /* Back-pointer for dispatching response */
     char *resp_data;              /* Accumulated response body */
     size_t resp_size;             /* Response body size */
+    struct sockaddr_storage dest_ss; /* Address we sent to (for source override) */
 };
 
 /* Private class data */
@@ -1427,6 +1428,7 @@ na_http_send_msg(struct na_http_class *priv,
             return NA_NOMEM;
         }
         cs->priv = priv;
+        memcpy(&cs->dest_ss, dest_ss, sizeof(cs->dest_ss));
 
         curl_easy_setopt(easy, CURLOPT_URL, url);
         curl_easy_setopt(easy, CURLOPT_POST, 1L);
@@ -2154,7 +2156,8 @@ na_http_process_rma_resp(struct na_http_class *priv,
 /*---------------------------------------------------------------------------*/
 static void
 na_http_dispatch_message(struct na_http_class *priv,
-    const char *body, size_t body_size)
+    const char *body, size_t body_size,
+    const struct sockaddr_storage *source_override)
 {
     struct na_http_msg_hdr hdr;
     struct na_http_rma_hdr rma_hdr;
@@ -2200,6 +2203,12 @@ na_http_dispatch_message(struct na_http_class *priv,
     /* Parse source sockaddr_storage */
     memset(&source_ss, 0, sizeof(source_ss));
     memcpy(&source_ss, ptr, NA_HTTP_SOURCE_SIZE);
+
+    /* Use source override if provided (NAT traversal: the wire's source_ss
+     * is the remote's self_addr which may be a private address unreachable
+     * from us; the override is the address we actually connected to) */
+    if (source_override != NULL && source_override->ss_family != 0)
+        memcpy(&source_ss, source_override, sizeof(source_ss));
 
     /* Create source addr for msg dispatch */
     if (source_ss.ss_family != 0) {
@@ -2302,7 +2311,7 @@ na_http_mhd_handler(void *cls, struct MHD_Connection *connection,
 
         /* Dispatch the inbound message */
         if (rs->data != NULL && rs->data_size > 0) {
-            na_http_dispatch_message(priv, rs->data, rs->data_size);
+            na_http_dispatch_message(priv, rs->data, rs->data_size, NULL);
 
             /* Extract source_ss from wire body for pool keying */
             size_t min_size = NA_HTTP_MSG_HDR_SIZE + NA_HTTP_RMA_HDR_SIZE +
@@ -2438,10 +2447,14 @@ na_http_progress(struct na_http_class *priv)
             curl_multi_remove_handle(priv->curl_multi, easy);
             curl_easy_cleanup(easy);
             if (cs != NULL) {
-                /* Dispatch response body as incoming message */
+                /* Dispatch response body as incoming message.
+                 * Use dest_ss as source override — the wire body's
+                 * source_ss is the remote's self_addr (private addr
+                 * behind NAT), but Mercury expects the address we
+                 * connected to (public addr). */
                 if (cs->resp_data != NULL && cs->resp_size > 0) {
                     na_http_dispatch_message(
-                        priv, cs->resp_data, cs->resp_size);
+                        priv, cs->resp_data, cs->resp_size, &cs->dest_ss);
                 }
                 free(cs->resp_data);
                 curl_slist_free_all(cs->headers);
@@ -2513,10 +2526,14 @@ na_http_poll_wait(na_class_t *na_class, na_context_t NA_UNUSED *context,
     unsigned int timeout_ms, unsigned int *count_p)
 {
     struct na_http_class *priv = NA_HTTP_CLASS(na_class);
-    struct pollfd pfds[2];
+    struct pollfd pfds[66]; /* 2 fixed (mhd + wakeup) + up to 64 curl FDs */
+    nfds_t npfds;
     int nfds;
     int wait_ms;
     MHD_UNSIGNED_LONG_LONG mhd_timeout;
+    fd_set curl_rd, curl_wr, curl_ex;
+    int curl_max_fd = -1;
+    long curl_timeout_ms;
 
     /* Always do one progress first to handle any pending work */
     hg_thread_mutex_lock(&priv->socket_lock);
@@ -2530,15 +2547,51 @@ na_http_poll_wait(na_class_t *na_class, na_context_t NA_UNUSED *context,
             wait_ms = (int) mhd_timeout;
     }
 
-    /* Wait on MHD epoll FD + wakeup pipe */
-    pfds[0].fd = priv->mhd_epoll_fd;
-    pfds[0].events = POLLIN;
-    pfds[0].revents = 0;
-    pfds[1].fd = priv->wakeup_pipe[0];
-    pfds[1].events = POLLIN;
-    pfds[1].revents = 0;
+    /* Get curl's FDs and timeout */
+    FD_ZERO(&curl_rd);
+    FD_ZERO(&curl_wr);
+    FD_ZERO(&curl_ex);
+    curl_multi_fdset(priv->curl_multi, &curl_rd, &curl_wr, &curl_ex,
+        &curl_max_fd);
+    if (curl_multi_timeout(priv->curl_multi, &curl_timeout_ms) == CURLM_OK &&
+        curl_timeout_ms >= 0) {
+        if ((int) curl_timeout_ms < wait_ms)
+            wait_ms = (int) curl_timeout_ms;
+    }
 
-    nfds = poll(pfds, 2, wait_ms);
+    /* Build pollfd array: MHD epoll FD + wakeup pipe + curl FDs */
+    npfds = 0;
+    pfds[npfds].fd = priv->mhd_epoll_fd;
+    pfds[npfds].events = POLLIN;
+    pfds[npfds].revents = 0;
+    npfds++;
+
+    pfds[npfds].fd = priv->wakeup_pipe[0];
+    pfds[npfds].events = POLLIN;
+    pfds[npfds].revents = 0;
+    npfds++;
+
+    /* Add curl FDs to the poll set */
+    {
+        int fd;
+        for (fd = 0; fd <= curl_max_fd && npfds < 66; fd++) {
+            short events = 0;
+            if (FD_ISSET(fd, &curl_rd))
+                events |= POLLIN;
+            if (FD_ISSET(fd, &curl_wr))
+                events |= POLLOUT;
+            if (FD_ISSET(fd, &curl_ex))
+                events |= POLLPRI;
+            if (events != 0) {
+                pfds[npfds].fd = fd;
+                pfds[npfds].events = events;
+                pfds[npfds].revents = 0;
+                npfds++;
+            }
+        }
+    }
+
+    nfds = poll(pfds, npfds, wait_ms);
     if (nfds < 0 && errno != EINTR)
         return NA_IO_ERROR;
 

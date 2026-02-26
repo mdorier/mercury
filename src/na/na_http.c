@@ -44,6 +44,9 @@
 #define NA_HTTP_MSG_UNEXPECTED_SIZE (4096)
 #define NA_HTTP_MSG_EXPECTED_SIZE   (4 * 1024 * 1024)
 
+/* Max held connections per client (for NAT traversal) */
+#define NA_HTTP_MAX_HELD_PER_CLIENT 8
+
 /* Op status bits */
 #define NA_HTTP_OP_COMPLETED (1 << 0)
 #define NA_HTTP_OP_CANCELED  (1 << 1)
@@ -156,16 +159,36 @@ struct na_http_msg_recv_expected {
     uint8_t dest_id;
 };
 
+/* Held MHD connection waiting to carry a response (NAT traversal) */
+struct na_http_held_conn {
+    STAILQ_ENTRY(na_http_held_conn) entry;
+    struct MHD_Connection *connection;
+    struct na_http_request_state *rs;   /* Back-pointer to clear rs->held */
+};
+
+/* Per-client pool of held connections */
+struct na_http_client_pool {
+    STAILQ_ENTRY(na_http_client_pool) entry;
+    struct sockaddr_storage client_ss;
+    STAILQ_HEAD(, na_http_held_conn) held_conns;
+    int count;
+};
+
 /* MHD per-request state (body accumulation) */
 struct na_http_request_state {
     char *data;
     size_t data_size;
     size_t data_alloc;
+    struct na_http_held_conn *held;    /* Non-NULL if connection is suspended */
+    struct na_http_class *priv;        /* Back-pointer for cleanup */
 };
 
 /* Per-transfer state for curl cleanup */
 struct na_http_curl_state {
     struct curl_slist *headers;
+    struct na_http_class *priv;   /* Back-pointer for dispatching response */
+    char *resp_data;              /* Accumulated response body */
+    size_t resp_size;             /* Response body size */
 };
 
 /* Private class data */
@@ -196,6 +219,9 @@ struct na_http_class {
     /* Memory handle map (for RMA) */
     hg_hash_table_t *mem_handle_map;
     hg_atomic_int64_t next_handle_id;
+
+    /* Held connection pools for NAT traversal */
+    STAILQ_HEAD(, na_http_client_pool) client_pools;
 
     /* Message size limits */
     size_t max_unexpected_size;
@@ -443,8 +469,16 @@ na_http_mhd_completed(void *cls, struct MHD_Connection *connection,
     void **req_cls, enum MHD_RequestTerminationCode toe);
 
 static size_t
-na_http_curl_discard_cb(void *contents, size_t size, size_t nmemb,
+na_http_curl_write_cb(void *contents, size_t size, size_t nmemb,
     void *userp);
+
+static bool
+na_http_ss_equal(const struct sockaddr_storage *a,
+    const struct sockaddr_storage *b);
+
+static struct na_http_client_pool *
+na_http_find_client_pool(struct na_http_class *priv,
+    const struct sockaddr_storage *client_ss);
 
 /*******************/
 /* Local Variables */
@@ -552,10 +586,58 @@ na_http_complete_op(struct na_http_op_id *op, na_return_t ret)
 
 /*---------------------------------------------------------------------------*/
 static size_t
-na_http_curl_discard_cb(void NA_UNUSED *contents, size_t size, size_t nmemb,
-    void NA_UNUSED *userp)
+na_http_curl_write_cb(void *contents, size_t size, size_t nmemb, void *userp)
 {
-    return size * nmemb;
+    struct na_http_curl_state *cs = (struct na_http_curl_state *) userp;
+    size_t realsize = size * nmemb;
+    char *new_data;
+
+    if (realsize == 0)
+        return 0;
+
+    new_data = (char *) realloc(cs->resp_data, cs->resp_size + realsize);
+    if (new_data == NULL)
+        return 0;
+    cs->resp_data = new_data;
+    memcpy(cs->resp_data + cs->resp_size, contents, realsize);
+    cs->resp_size += realsize;
+
+    return realsize;
+}
+
+/*---------------------------------------------------------------------------*/
+static bool
+na_http_ss_equal(const struct sockaddr_storage *a,
+    const struct sockaddr_storage *b)
+{
+    if (a->ss_family != b->ss_family)
+        return false;
+    if (a->ss_family == AF_INET) {
+        const struct sockaddr_in *sa = (const struct sockaddr_in *) a;
+        const struct sockaddr_in *sb = (const struct sockaddr_in *) b;
+        return sa->sin_port == sb->sin_port &&
+               sa->sin_addr.s_addr == sb->sin_addr.s_addr;
+    } else if (a->ss_family == AF_INET6) {
+        const struct sockaddr_in6 *sa = (const struct sockaddr_in6 *) a;
+        const struct sockaddr_in6 *sb = (const struct sockaddr_in6 *) b;
+        return sa->sin6_port == sb->sin6_port &&
+               memcmp(&sa->sin6_addr, &sb->sin6_addr, 16) == 0;
+    }
+    return false;
+}
+
+/*---------------------------------------------------------------------------*/
+static struct na_http_client_pool *
+na_http_find_client_pool(struct na_http_class *priv,
+    const struct sockaddr_storage *client_ss)
+{
+    struct na_http_client_pool *pool;
+
+    STAILQ_FOREACH(pool, &priv->client_pools, entry) {
+        if (na_http_ss_equal(&pool->client_ss, client_ss))
+            return pool;
+    }
+    return NULL;
 }
 
 /*---------------------------------------------------------------------------*/
@@ -656,6 +738,7 @@ na_http_initialize(
     STAILQ_INIT(&priv->rma_get_queue);
     STAILQ_INIT(&priv->unexpected_msg_queue);
     STAILQ_INIT(&priv->expected_msg_queue);
+    STAILQ_INIT(&priv->client_pools);
 
     /* Initialize locks */
     rc = hg_thread_mutex_init(&priv->socket_lock);
@@ -723,7 +806,8 @@ na_http_initialize(
 
         /* Start MHD daemon with epoll */
         priv->mhd_daemon = MHD_start_daemon(
-            MHD_USE_EPOLL | MHD_USE_NO_THREAD_SAFETY,
+            MHD_USE_EPOLL | MHD_USE_NO_THREAD_SAFETY |
+                MHD_ALLOW_SUSPEND_RESUME,
             port, NULL, NULL,
             na_http_mhd_handler, priv,
             MHD_OPTION_NOTIFY_COMPLETED, na_http_mhd_completed, priv,
@@ -832,12 +916,43 @@ na_http_finalize(na_class_t *na_class)
                 curl_multi_remove_handle(priv->curl_multi, msg->easy_handle);
                 curl_easy_cleanup(msg->easy_handle);
                 if (cs != NULL) {
+                    free(cs->resp_data);
                     curl_slist_free_all(cs->headers);
                     free(cs);
                 }
             }
         }
         curl_multi_cleanup(priv->curl_multi);
+    }
+
+    /* Resume all held connections before stopping MHD (API requirement) */
+    {
+        struct na_http_client_pool *pool;
+        while (!STAILQ_EMPTY(&priv->client_pools)) {
+            pool = STAILQ_FIRST(&priv->client_pools);
+            STAILQ_REMOVE_HEAD(&priv->client_pools, entry);
+
+            struct na_http_held_conn *hc;
+            while (!STAILQ_EMPTY(&pool->held_conns)) {
+                hc = STAILQ_FIRST(&pool->held_conns);
+                STAILQ_REMOVE_HEAD(&pool->held_conns, entry);
+
+                struct MHD_Response *response =
+                    MHD_create_response_from_buffer(
+                        0, NULL, MHD_RESPMEM_PERSISTENT);
+                if (response != NULL) {
+                    MHD_queue_response(
+                        hc->connection, MHD_HTTP_OK, response);
+                    MHD_destroy_response(response);
+                }
+                MHD_resume_connection(hc->connection);
+                hc->rs->held = NULL;
+                free(hc);
+            }
+            free(pool);
+        }
+        if (priv->mhd_daemon != NULL)
+            MHD_run(priv->mhd_daemon);
     }
 
     /* Stop MHD daemon */
@@ -1208,32 +1323,12 @@ na_http_send_msg(struct na_http_class *priv,
     const struct na_http_rma_hdr *rma_hdr,
     const void *payload, size_t payload_size)
 {
-    CURL *easy = NULL;
-    struct na_http_curl_state *cs = NULL;
     struct na_http_rma_hdr zero_rma;
-    char url[256];
     char *wire_buf = NULL;
     size_t wire_size;
     size_t offset;
-    CURLMcode mc;
 
-    /* Build URL from dest_ss */
-    if (dest_ss->ss_family == AF_INET) {
-        const struct sockaddr_in *sin = (const struct sockaddr_in *) dest_ss;
-        char ip_str[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &sin->sin_addr, ip_str, sizeof(ip_str));
-        snprintf(url, sizeof(url), "http://%s:%u/",
-            ip_str, ntohs(sin->sin_port));
-    } else {
-        const struct sockaddr_in6 *sin6 =
-            (const struct sockaddr_in6 *) dest_ss;
-        char ip_str[INET6_ADDRSTRLEN];
-        inet_ntop(AF_INET6, &sin6->sin6_addr, ip_str, sizeof(ip_str));
-        snprintf(url, sizeof(url), "http://[%s]:%u/",
-            ip_str, ntohs(sin6->sin6_port));
-    }
-
-    /* Assemble binary body: hdr + rma_hdr + payload + source_ss */
+    /* Build wire body: hdr + rma_hdr + payload + source_ss */
     wire_size = NA_HTTP_MSG_HDR_SIZE + NA_HTTP_RMA_HDR_SIZE +
                 payload_size + NA_HTTP_SOURCE_SIZE;
     wire_buf = (char *) malloc(wire_size);
@@ -1241,12 +1336,9 @@ na_http_send_msg(struct na_http_class *priv,
         return NA_NOMEM;
 
     offset = 0;
-
-    /* msg_hdr */
     memcpy(wire_buf + offset, hdr, NA_HTTP_MSG_HDR_SIZE);
     offset += NA_HTTP_MSG_HDR_SIZE;
 
-    /* rma_hdr (zeros if NULL) */
     if (rma_hdr != NULL) {
         memcpy(wire_buf + offset, rma_hdr, NA_HTTP_RMA_HDR_SIZE);
     } else {
@@ -1255,56 +1347,113 @@ na_http_send_msg(struct na_http_class *priv,
     }
     offset += NA_HTTP_RMA_HDR_SIZE;
 
-    /* payload */
     if (payload != NULL && payload_size > 0) {
         memcpy(wire_buf + offset, payload, payload_size);
     }
     offset += payload_size;
 
-    /* source sockaddr_storage */
     memcpy(wire_buf + offset, &priv->self_addr, NA_HTTP_SOURCE_SIZE);
 
-    /* Set up curl easy handle */
-    easy = curl_easy_init();
-    if (easy == NULL) {
+    /* Try to send via a held connection (NAT traversal) */
+    {
+        struct na_http_client_pool *pool;
+        struct na_http_held_conn *hc = NULL;
+
+        hg_thread_mutex_lock(&priv->queue_lock);
+        pool = na_http_find_client_pool(priv, dest_ss);
+        if (pool != NULL) {
+            hc = STAILQ_FIRST(&pool->held_conns);
+            if (hc != NULL) {
+                STAILQ_REMOVE_HEAD(&pool->held_conns, entry);
+                pool->count--;
+            }
+        }
+        hg_thread_mutex_unlock(&priv->queue_lock);
+
+        if (hc != NULL) {
+            struct MHD_Response *response =
+                MHD_create_response_from_buffer(
+                    wire_size, wire_buf, MHD_RESPMEM_MUST_FREE);
+            if (response != NULL) {
+                MHD_add_response_header(response,
+                    "Content-Type", "application/octet-stream");
+                MHD_queue_response(
+                    hc->connection, MHD_HTTP_OK, response);
+                MHD_destroy_response(response);
+                MHD_resume_connection(hc->connection);
+                hc->rs->held = NULL;
+                free(hc);
+                na_http_wakeup(priv);
+                return NA_SUCCESS; /* wire_buf owned by MHD */
+            }
+            /* MHD response creation failed, fall through to curl */
+            free(hc);
+        }
+    }
+
+    /* Fallback: send via curl POST */
+    {
+        CURL *easy = NULL;
+        struct na_http_curl_state *cs = NULL;
+        char url[256];
+        CURLMcode mc;
+
+        if (dest_ss->ss_family == AF_INET) {
+            const struct sockaddr_in *sin =
+                (const struct sockaddr_in *) dest_ss;
+            char ip_str[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &sin->sin_addr, ip_str, sizeof(ip_str));
+            snprintf(url, sizeof(url), "http://%s:%u/",
+                ip_str, ntohs(sin->sin_port));
+        } else {
+            const struct sockaddr_in6 *sin6 =
+                (const struct sockaddr_in6 *) dest_ss;
+            char ip_str[INET6_ADDRSTRLEN];
+            inet_ntop(AF_INET6, &sin6->sin6_addr, ip_str, sizeof(ip_str));
+            snprintf(url, sizeof(url), "http://[%s]:%u/",
+                ip_str, ntohs(sin6->sin6_port));
+        }
+
+        easy = curl_easy_init();
+        if (easy == NULL) {
+            free(wire_buf);
+            return NA_NOMEM;
+        }
+
+        cs = (struct na_http_curl_state *) calloc(1, sizeof(*cs));
+        if (cs == NULL) {
+            curl_easy_cleanup(easy);
+            free(wire_buf);
+            return NA_NOMEM;
+        }
+        cs->priv = priv;
+
+        curl_easy_setopt(easy, CURLOPT_URL, url);
+        curl_easy_setopt(easy, CURLOPT_POST, 1L);
+        curl_easy_setopt(easy, CURLOPT_POSTFIELDSIZE, (long) wire_size);
+        curl_easy_setopt(easy, CURLOPT_COPYPOSTFIELDS, wire_buf);
+        curl_easy_setopt(easy, CURLOPT_NOSIGNAL, 1L);
+        curl_easy_setopt(easy, CURLOPT_WRITEFUNCTION, na_http_curl_write_cb);
+        curl_easy_setopt(easy, CURLOPT_WRITEDATA, cs);
+
+        cs->headers = curl_slist_append(NULL,
+            "Content-Type: application/octet-stream");
+        curl_easy_setopt(easy, CURLOPT_HTTPHEADER, cs->headers);
+        curl_easy_setopt(easy, CURLOPT_PRIVATE, cs);
+
+        mc = curl_multi_add_handle(priv->curl_multi, easy);
         free(wire_buf);
-        return NA_NOMEM;
+
+        if (mc != CURLM_OK) {
+            curl_slist_free_all(cs->headers);
+            free(cs);
+            curl_easy_cleanup(easy);
+            return NA_PROTOCOL_ERROR;
+        }
+
+        na_http_wakeup(priv);
+        return NA_SUCCESS;
     }
-
-    cs = (struct na_http_curl_state *) calloc(1, sizeof(*cs));
-    if (cs == NULL) {
-        curl_easy_cleanup(easy);
-        free(wire_buf);
-        return NA_NOMEM;
-    }
-
-    curl_easy_setopt(easy, CURLOPT_URL, url);
-    curl_easy_setopt(easy, CURLOPT_POST, 1L);
-    curl_easy_setopt(easy, CURLOPT_POSTFIELDSIZE, (long) wire_size);
-    curl_easy_setopt(easy, CURLOPT_COPYPOSTFIELDS, wire_buf);
-    curl_easy_setopt(easy, CURLOPT_NOSIGNAL, 1L);
-    curl_easy_setopt(easy, CURLOPT_WRITEFUNCTION, na_http_curl_discard_cb);
-
-    cs->headers = curl_slist_append(NULL,
-        "Content-Type: application/octet-stream");
-    curl_easy_setopt(easy, CURLOPT_HTTPHEADER, cs->headers);
-    curl_easy_setopt(easy, CURLOPT_PRIVATE, cs);
-
-    /* Add to multi handle */
-    mc = curl_multi_add_handle(priv->curl_multi, easy);
-    free(wire_buf);
-
-    if (mc != CURLM_OK) {
-        curl_slist_free_all(cs->headers);
-        free(cs);
-        curl_easy_cleanup(easy);
-        return NA_PROTOCOL_ERROR;
-    }
-
-    /* Signal wakeup */
-    na_http_wakeup(priv);
-
-    return NA_SUCCESS;
 }
 
 /*---------------------------------------------------------------------------*/
@@ -2105,7 +2254,7 @@ na_http_dispatch_message(struct na_http_class *priv,
 
 /*---------------------------------------------------------------------------*/
 static enum MHD_Result
-na_http_mhd_handler(void *cls, struct MHD_Connection NA_UNUSED *connection,
+na_http_mhd_handler(void *cls, struct MHD_Connection *connection,
     const char NA_UNUSED *url, const char NA_UNUSED *method,
     const char NA_UNUSED *version,
     const char *upload_data, size_t *upload_data_size, void **req_cls)
@@ -2118,6 +2267,7 @@ na_http_mhd_handler(void *cls, struct MHD_Connection NA_UNUSED *connection,
             (struct na_http_request_state *) calloc(1, sizeof(*rs));
         if (rs == NULL)
             return MHD_NO;
+        rs->priv = priv;
         *req_cls = rs;
         return MHD_YES;
     }
@@ -2147,32 +2297,116 @@ na_http_mhd_handler(void *cls, struct MHD_Connection NA_UNUSED *connection,
     {
         struct na_http_request_state *rs =
             (struct na_http_request_state *) *req_cls;
-        struct MHD_Response *response;
-        enum MHD_Result mhd_ret;
+        struct sockaddr_storage source_ss;
+        bool has_source = false;
 
+        /* Dispatch the inbound message */
         if (rs->data != NULL && rs->data_size > 0) {
             na_http_dispatch_message(priv, rs->data, rs->data_size);
+
+            /* Extract source_ss from wire body for pool keying */
+            size_t min_size = NA_HTTP_MSG_HDR_SIZE + NA_HTTP_RMA_HDR_SIZE +
+                              NA_HTTP_SOURCE_SIZE;
+            if (rs->data_size >= min_size) {
+                size_t payload_size = rs->data_size - min_size;
+                memcpy(&source_ss,
+                    rs->data + NA_HTTP_MSG_HDR_SIZE + NA_HTTP_RMA_HDR_SIZE +
+                        payload_size,
+                    NA_HTTP_SOURCE_SIZE);
+                has_source = (source_ss.ss_family != 0);
+            }
         }
 
-        response = MHD_create_response_from_buffer(
-            0, NULL, MHD_RESPMEM_PERSISTENT);
-        mhd_ret = MHD_queue_response(connection, MHD_HTTP_OK, response);
-        MHD_destroy_response(response);
+        /* Free accumulated body (already dispatched) */
+        free(rs->data);
+        rs->data = NULL;
+        rs->data_size = 0;
+        rs->data_alloc = 0;
 
-        return mhd_ret;
+        /* Try to suspend connection and add to held pool */
+        if (has_source) {
+            struct na_http_held_conn *hc = (struct na_http_held_conn *)
+                calloc(1, sizeof(*hc));
+            if (hc != NULL) {
+                struct na_http_client_pool *pool;
+
+                hc->connection = connection;
+                hc->rs = rs;
+
+                hg_thread_mutex_lock(&priv->queue_lock);
+                pool = na_http_find_client_pool(priv, &source_ss);
+                if (pool == NULL) {
+                    pool = (struct na_http_client_pool *)
+                        calloc(1, sizeof(*pool));
+                    if (pool != NULL) {
+                        memcpy(&pool->client_ss, &source_ss,
+                            sizeof(source_ss));
+                        STAILQ_INIT(&pool->held_conns);
+                        pool->count = 0;
+                        STAILQ_INSERT_TAIL(
+                            &priv->client_pools, pool, entry);
+                    }
+                }
+                if (pool != NULL &&
+                    pool->count < NA_HTTP_MAX_HELD_PER_CLIENT) {
+                    STAILQ_INSERT_TAIL(&pool->held_conns, hc, entry);
+                    pool->count++;
+                    rs->held = hc;
+                    hg_thread_mutex_unlock(&priv->queue_lock);
+
+                    MHD_suspend_connection(connection);
+                    return MHD_YES;
+                }
+                hg_thread_mutex_unlock(&priv->queue_lock);
+                free(hc);
+            }
+        }
+
+        /* Fallback: immediate 200 OK */
+        {
+            struct MHD_Response *response =
+                MHD_create_response_from_buffer(
+                    0, NULL, MHD_RESPMEM_PERSISTENT);
+            enum MHD_Result mhd_ret =
+                MHD_queue_response(connection, MHD_HTTP_OK, response);
+            MHD_destroy_response(response);
+            return mhd_ret;
+        }
     }
 }
 
 /*---------------------------------------------------------------------------*/
 static void
-na_http_mhd_completed(void NA_UNUSED *cls,
+na_http_mhd_completed(void *cls,
     struct MHD_Connection NA_UNUSED *connection,
     void **req_cls, enum MHD_RequestTerminationCode NA_UNUSED toe)
 {
+    struct na_http_class *priv = (struct na_http_class *) cls;
     struct na_http_request_state *rs =
         (struct na_http_request_state *) *req_cls;
 
     if (rs != NULL) {
+        /* If this connection was held, remove from pool */
+        if (rs->held != NULL) {
+            hg_thread_mutex_lock(&priv->queue_lock);
+            {
+                struct na_http_client_pool *pool;
+                STAILQ_FOREACH(pool, &priv->client_pools, entry) {
+                    struct na_http_held_conn *hc;
+                    STAILQ_FOREACH(hc, &pool->held_conns, entry) {
+                        if (hc == rs->held) {
+                            STAILQ_REMOVE(&pool->held_conns, hc,
+                                na_http_held_conn, entry);
+                            pool->count--;
+                            break;
+                        }
+                    }
+                }
+            }
+            hg_thread_mutex_unlock(&priv->queue_lock);
+            free(rs->held);
+        }
+
         free(rs->data);
         free(rs);
         *req_cls = NULL;
@@ -2204,6 +2438,12 @@ na_http_progress(struct na_http_class *priv)
             curl_multi_remove_handle(priv->curl_multi, easy);
             curl_easy_cleanup(easy);
             if (cs != NULL) {
+                /* Dispatch response body as incoming message */
+                if (cs->resp_data != NULL && cs->resp_size > 0) {
+                    na_http_dispatch_message(
+                        priv, cs->resp_data, cs->resp_size);
+                }
+                free(cs->resp_data);
                 curl_slist_free_all(cs->headers);
                 free(cs);
             }

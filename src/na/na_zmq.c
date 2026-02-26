@@ -147,20 +147,21 @@ struct na_zmq_msg_recv_expected {
     uint8_t dest_id;
 };
 
-/* Peer tracking (tracks zmq_connect() calls and identity mapping) */
+/* Peer tracking (tracks connections and identity mapping) */
 struct na_zmq_peer {
     struct sockaddr_storage ss;
     uint64_t addr_hash;             /* Hash of sockaddr for fast lookup */
-    uint8_t *identity;              /* ZMQ identity bytes for routing */
+    uint8_t *identity;              /* ZMQ identity bytes for ROUTER routing */
     size_t identity_size;
-    bool connected;                 /* True if we called zmq_connect() */
+    void *dealer_socket;            /* ZMQ_DEALER for outbound, or NULL */
+    bool is_inbound;                /* True if this peer connected to us */
     STAILQ_ENTRY(na_zmq_peer) entry;
 };
 
 /* Private class data */
 struct na_zmq_class {
     void *zmq_context;                  /* zmq_ctx_new() */
-    void *zmq_socket;                   /* ZMQ_ROUTER socket */
+    void *router_socket;                /* ZMQ_ROUTER socket */
     struct sockaddr_storage self_addr;   /* Our bound address */
     socklen_t self_addr_len;
 
@@ -576,7 +577,7 @@ na_zmq_update_peer_identity(struct na_zmq_class *priv,
         return;
     }
 
-    /* Create new peer entry */
+    /* Create new peer entry (inbound — they connected to us) */
     peer = (struct na_zmq_peer *) calloc(1, sizeof(*peer));
     if (peer == NULL)
         return;
@@ -589,7 +590,7 @@ na_zmq_update_peer_identity(struct na_zmq_class *priv,
         memcpy(peer->identity, identity, identity_size);
         peer->identity_size = identity_size;
     }
-    peer->connected = false; /* They connected to us, not us to them */
+    peer->is_inbound = true;
     STAILQ_INSERT_TAIL(&priv->peer_list, peer, entry);
 }
 
@@ -686,8 +687,8 @@ na_zmq_initialize(
         NA_PROTOCOL_ERROR, "zmq_ctx_new() failed");
 
     /* Create ROUTER socket */
-    priv->zmq_socket = zmq_socket(priv->zmq_context, ZMQ_ROUTER);
-    NA_CHECK_SUBSYS_ERROR(cls, priv->zmq_socket == NULL, error, ret,
+    priv->router_socket = zmq_socket(priv->zmq_context, ZMQ_ROUTER);
+    NA_CHECK_SUBSYS_ERROR(cls, priv->router_socket == NULL, error, ret,
         NA_PROTOCOL_ERROR, "zmq_socket(ZMQ_ROUTER) failed");
 
     /* Set socket options */
@@ -696,19 +697,19 @@ na_zmq_initialize(
 
         /* Allow pending messages to flush on close */
         opt_val = 1000;
-        zmq_setsockopt(priv->zmq_socket, ZMQ_LINGER, &opt_val,
+        zmq_setsockopt(priv->router_socket, ZMQ_LINGER, &opt_val,
             sizeof(opt_val));
 
         /* Unlimited high-water marks */
         opt_val = 0;
-        zmq_setsockopt(priv->zmq_socket, ZMQ_SNDHWM, &opt_val,
+        zmq_setsockopt(priv->router_socket, ZMQ_SNDHWM, &opt_val,
             sizeof(opt_val));
-        zmq_setsockopt(priv->zmq_socket, ZMQ_RCVHWM, &opt_val,
+        zmq_setsockopt(priv->router_socket, ZMQ_RCVHWM, &opt_val,
             sizeof(opt_val));
 
         /* Error on unroutable messages */
         opt_val = 1;
-        zmq_setsockopt(priv->zmq_socket, ZMQ_ROUTER_MANDATORY, &opt_val,
+        zmq_setsockopt(priv->router_socket, ZMQ_ROUTER_MANDATORY, &opt_val,
             sizeof(opt_val));
     }
 
@@ -771,7 +772,7 @@ na_zmq_initialize(
         }
 
         /* Bind */
-        rc = zmq_bind(priv->zmq_socket, bind_endpoint);
+        rc = zmq_bind(priv->router_socket, bind_endpoint);
         if (rc != 0) {
             free(sa);
             NA_GOTO_SUBSYS_ERROR(cls, error, ret, NA_ADDRINUSE,
@@ -781,7 +782,7 @@ na_zmq_initialize(
 
         /* If port was 0 (ephemeral), query the actual bound port */
         last_endpoint_len = sizeof(last_endpoint);
-        zmq_getsockopt(priv->zmq_socket, ZMQ_LAST_ENDPOINT,
+        zmq_getsockopt(priv->router_socket, ZMQ_LAST_ENDPOINT,
             last_endpoint, &last_endpoint_len);
 
         /* Store self address */
@@ -821,8 +822,8 @@ na_zmq_initialize(
 
 error:
     if (priv != NULL) {
-        if (priv->zmq_socket != NULL)
-            zmq_close(priv->zmq_socket);
+        if (priv->router_socket != NULL)
+            zmq_close(priv->router_socket);
         if (priv->zmq_context != NULL)
             zmq_ctx_destroy(priv->zmq_context);
         if (priv->mem_handle_map != NULL)
@@ -845,9 +846,20 @@ na_zmq_finalize(na_class_t *na_class)
 
     NA_LOG_SUBSYS_DEBUG(cls, "Finalizing ZMQ plugin");
 
-    /* Close ZMQ socket and context */
-    if (priv->zmq_socket != NULL)
-        zmq_close(priv->zmq_socket);
+    /* Close all DEALER sockets first (must be before zmq_ctx_destroy) */
+    {
+        struct na_zmq_peer *peer;
+        STAILQ_FOREACH(peer, &priv->peer_list, entry) {
+            if (peer->dealer_socket != NULL) {
+                zmq_close(peer->dealer_socket);
+                peer->dealer_socket = NULL;
+            }
+        }
+    }
+
+    /* Close ROUTER socket and context */
+    if (priv->router_socket != NULL)
+        zmq_close(priv->router_socket);
     if (priv->zmq_context != NULL)
         zmq_ctx_destroy(priv->zmq_context);
 
@@ -1220,17 +1232,15 @@ na_zmq_ensure_connect(struct na_zmq_class *priv,
     struct na_zmq_peer *peer;
     char endpoint[256];
     uint64_t addr_hash = na_zmq_hash_addr(dest_ss);
-    socklen_t salen;
+    void *dealer;
+    int opt_val;
 
-    /* Check if we already know this peer (either they connected to us,
-     * or we connected to them) */
+    /* Check if we already know this peer (either they connected to us
+     * via ROUTER and we have their identity, or we have a DEALER) */
     peer = na_zmq_find_peer_by_hash(priv, addr_hash);
-    if (peer != NULL && (peer->connected || peer->identity != NULL))
+    if (peer != NULL && (peer->dealer_socket != NULL ||
+                         peer->identity != NULL))
         return NA_SUCCESS;
-
-    salen = (dest_ss->ss_family == AF_INET6)
-                ? (socklen_t) sizeof(struct sockaddr_in6)
-                : (socklen_t) sizeof(struct sockaddr_in);
 
     /* Build endpoint string */
     if (dest_ss->ss_family == AF_INET) {
@@ -1248,43 +1258,38 @@ na_zmq_ensure_connect(struct na_zmq_class *priv,
             ip_str, ntohs(sin6->sin6_port));
     }
 
-    /* Set connect routing ID to sockaddr bytes. This identity is what
-     * the peer's ROUTER socket will see in its identity frame when
-     * receiving messages from us. */
-    zmq_setsockopt(priv->zmq_socket, ZMQ_CONNECT_ROUTING_ID,
-        dest_ss, salen);
-
-    if (zmq_connect(priv->zmq_socket, endpoint) != 0)
+    /* Create a dedicated DEALER socket for this outbound connection */
+    dealer = zmq_socket(priv->zmq_context, ZMQ_DEALER);
+    if (dealer == NULL)
         return NA_PROTOCOL_ERROR;
+
+    /* Set socket options */
+    opt_val = 1000;
+    zmq_setsockopt(dealer, ZMQ_LINGER, &opt_val, sizeof(opt_val));
+    opt_val = 0;
+    zmq_setsockopt(dealer, ZMQ_SNDHWM, &opt_val, sizeof(opt_val));
+    zmq_setsockopt(dealer, ZMQ_RCVHWM, &opt_val, sizeof(opt_val));
+
+    if (zmq_connect(dealer, endpoint) != 0) {
+        zmq_close(dealer);
+        return NA_PROTOCOL_ERROR;
+    }
 
     if (peer != NULL) {
         /* Update existing peer entry (was created from an inbound msg) */
-        peer->connected = true;
-        /* For outbound connections, the identity we use to route TO this
-         * peer is the sockaddr bytes we set as CONNECT_ROUTING_ID */
-        if (peer->identity == NULL) {
-            peer->identity = (uint8_t *) malloc(salen);
-            if (peer->identity != NULL) {
-                memcpy(peer->identity, dest_ss, salen);
-                peer->identity_size = salen;
-            }
-        }
+        peer->dealer_socket = dealer;
     } else {
         /* Create new peer entry */
         peer = (struct na_zmq_peer *) calloc(1, sizeof(*peer));
-        if (peer == NULL)
+        if (peer == NULL) {
+            zmq_close(dealer);
             return NA_NOMEM;
+        }
 
         memcpy(&peer->ss, dest_ss, sizeof(*dest_ss));
         peer->addr_hash = addr_hash;
-        peer->connected = true;
-        /* Identity for routing = sockaddr bytes (what we set as
-         * CONNECT_ROUTING_ID) */
-        peer->identity = (uint8_t *) malloc(salen);
-        if (peer->identity != NULL) {
-            memcpy(peer->identity, dest_ss, salen);
-            peer->identity_size = salen;
-        }
+        peer->dealer_socket = dealer;
+        peer->is_inbound = false;
         STAILQ_INSERT_TAIL(&priv->peer_list, peer, entry);
     }
 
@@ -1302,6 +1307,8 @@ na_zmq_send_msg(struct na_zmq_class *priv,
     zmq_msg_t msg_identity, msg_hdr, msg_rma, msg_payload, msg_source;
     struct na_zmq_peer *peer;
     socklen_t self_salen;
+    void *send_socket;
+    bool use_dealer;
     int rc;
     na_return_t ret;
 
@@ -1309,19 +1316,26 @@ na_zmq_send_msg(struct na_zmq_class *priv,
     ret = na_zmq_ensure_connect(priv, dest_ss);
     NA_CHECK_SUBSYS_NA_ERROR(msg, error, ret, "Could not connect to peer");
 
-    /* Look up the peer's identity for routing */
+    /* Look up peer to determine send path */
     peer = na_zmq_find_peer_by_ss(priv, dest_ss);
-    NA_CHECK_SUBSYS_ERROR(msg, peer == NULL || peer->identity == NULL,
-        error, ret, NA_PROTOCOL_ERROR,
-        "No identity found for peer");
+    NA_CHECK_SUBSYS_ERROR(msg, peer == NULL, error, ret,
+        NA_PROTOCOL_ERROR, "No peer found for destination");
+
+    /* Choose socket: DEALER for outbound peers, ROUTER for inbound peers */
+    if (peer->dealer_socket != NULL) {
+        send_socket = peer->dealer_socket;
+        use_dealer = true;
+    } else if (peer->identity != NULL) {
+        send_socket = priv->router_socket;
+        use_dealer = false;
+    } else {
+        NA_GOTO_SUBSYS_ERROR(msg, error, ret, NA_PROTOCOL_ERROR,
+            "Peer has neither DEALER socket nor ROUTER identity");
+    }
 
     self_salen = (priv->self_addr.ss_family == AF_INET6)
                      ? (socklen_t) sizeof(struct sockaddr_in6)
                      : (socklen_t) sizeof(struct sockaddr_in);
-
-    /* Frame 0: identity (use stored identity for this peer) */
-    zmq_msg_init_size(&msg_identity, peer->identity_size);
-    memcpy(zmq_msg_data(&msg_identity), peer->identity, peer->identity_size);
 
     /* Frame 1: msg_hdr */
     zmq_msg_init_size(&msg_hdr, sizeof(*hdr));
@@ -1347,26 +1361,34 @@ na_zmq_send_msg(struct na_zmq_class *priv,
     zmq_msg_init_size(&msg_source, self_salen);
     memcpy(zmq_msg_data(&msg_source), &priv->self_addr, self_salen);
 
-    /* Send all frames */
-    rc = zmq_msg_send(&msg_identity, priv->zmq_socket, ZMQ_SNDMORE);
+    if (!use_dealer) {
+        /* Send via ROUTER: prepend identity frame */
+        zmq_msg_init_size(&msg_identity, peer->identity_size);
+        memcpy(zmq_msg_data(&msg_identity), peer->identity,
+            peer->identity_size);
+
+        rc = zmq_msg_send(&msg_identity, send_socket, ZMQ_SNDMORE);
+        if (rc < 0) goto send_error_router;
+    }
+
+    /* Send data frames (same for both DEALER and ROUTER after identity) */
+    rc = zmq_msg_send(&msg_hdr, send_socket, ZMQ_SNDMORE);
     if (rc < 0) goto send_error;
 
-    rc = zmq_msg_send(&msg_hdr, priv->zmq_socket, ZMQ_SNDMORE);
+    rc = zmq_msg_send(&msg_rma, send_socket, ZMQ_SNDMORE);
     if (rc < 0) goto send_error;
 
-    rc = zmq_msg_send(&msg_rma, priv->zmq_socket, ZMQ_SNDMORE);
+    rc = zmq_msg_send(&msg_payload, send_socket, ZMQ_SNDMORE);
     if (rc < 0) goto send_error;
 
-    rc = zmq_msg_send(&msg_payload, priv->zmq_socket, ZMQ_SNDMORE);
-    if (rc < 0) goto send_error;
-
-    rc = zmq_msg_send(&msg_source, priv->zmq_socket, 0);
+    rc = zmq_msg_send(&msg_source, send_socket, 0);
     if (rc < 0) goto send_error;
 
     return NA_SUCCESS;
 
-send_error:
+send_error_router:
     zmq_msg_close(&msg_identity);
+send_error:
     zmq_msg_close(&msg_hdr);
     zmq_msg_close(&msg_rma);
     zmq_msg_close(&msg_payload);
@@ -2064,25 +2086,84 @@ na_zmq_process_rma_resp(struct na_zmq_class *priv,
 }
 
 /*---------------------------------------------------------------------------*/
-static na_return_t
-na_zmq_progress(struct na_zmq_class *priv)
+static void
+na_zmq_dispatch_message(struct na_zmq_class *priv,
+    struct na_zmq_msg_hdr *hdr, struct na_zmq_rma_hdr *rma_hdr,
+    struct sockaddr_storage *source_ss, void *payload_data,
+    size_t payload_size)
+{
+    struct na_zmq_addr *source_addr = NULL;
+
+    /* Create source addr for msg dispatch */
+    if (source_ss->ss_family != 0) {
+        source_addr = (struct na_zmq_addr *) calloc(1,
+            sizeof(*source_addr));
+        if (source_addr != NULL) {
+            memcpy(&source_addr->ss, source_ss, sizeof(*source_ss));
+            hg_atomic_init32(&source_addr->refcount, 1);
+            source_addr->is_self = false;
+        }
+    }
+
+    /* Dispatch based on message type */
+    switch (hdr->type) {
+    case NA_ZMQ_MSG_UNEXPECTED:
+        na_zmq_process_recv_unexpected(priv, source_addr,
+            hdr->tag, payload_data, payload_size);
+        payload_data = NULL; /* ownership transferred */
+        break;
+
+    case NA_ZMQ_MSG_EXPECTED:
+        na_zmq_process_recv_expected(priv, source_addr,
+            hdr->tag, hdr->dest_id, payload_data, payload_size);
+        payload_data = NULL;
+        break;
+
+    case NA_ZMQ_MSG_RMA_PUT:
+        na_zmq_process_rma_put(priv, rma_hdr,
+            payload_data, payload_size);
+        payload_data = NULL;
+        break;
+
+    case NA_ZMQ_MSG_RMA_GET:
+        na_zmq_process_rma_get(priv, rma_hdr, source_ss);
+        break;
+
+    case NA_ZMQ_MSG_RMA_RESP:
+        na_zmq_process_rma_resp(priv, rma_hdr,
+            payload_data, payload_size);
+        payload_data = NULL;
+        break;
+
+    default:
+        break;
+    }
+
+    free(payload_data);
+    if (source_addr != NULL &&
+        hg_atomic_decr32(&source_addr->refcount) == 0)
+        free(source_addr);
+}
+
+/*---------------------------------------------------------------------------*/
+static void
+na_zmq_progress_router(struct na_zmq_class *priv)
 {
     zmq_msg_t msg_identity, msg_hdr, msg_rma, msg_payload;
     int rc;
 
-    /* Drain all available messages */
+    /* Drain all available messages from the ROUTER socket */
     for (;;) {
         struct na_zmq_msg_hdr hdr;
         struct na_zmq_rma_hdr rma_hdr;
         struct sockaddr_storage source_ss;
-        struct na_zmq_addr *source_addr = NULL;
         void *payload_data = NULL;
         size_t payload_size;
         zmq_msg_t msg_source;
 
         /* Read identity frame (opaque routing token from ROUTER socket) */
         zmq_msg_init(&msg_identity);
-        rc = zmq_msg_recv(&msg_identity, priv->zmq_socket, ZMQ_DONTWAIT);
+        rc = zmq_msg_recv(&msg_identity, priv->router_socket, ZMQ_DONTWAIT);
         if (rc < 0) {
             zmq_msg_close(&msg_identity);
             break; /* No more messages */
@@ -2106,7 +2187,7 @@ na_zmq_progress(struct na_zmq_class *priv)
 
         /* Read header frame */
         zmq_msg_init(&msg_hdr);
-        rc = zmq_msg_recv(&msg_hdr, priv->zmq_socket, 0);
+        rc = zmq_msg_recv(&msg_hdr, priv->router_socket, 0);
         if (rc < 0 || (size_t) rc < sizeof(hdr)) {
             zmq_msg_close(&msg_hdr);
             free(saved_identity);
@@ -2117,7 +2198,7 @@ na_zmq_progress(struct na_zmq_class *priv)
 
         /* Read RMA header frame */
         zmq_msg_init(&msg_rma);
-        rc = zmq_msg_recv(&msg_rma, priv->zmq_socket, 0);
+        rc = zmq_msg_recv(&msg_rma, priv->router_socket, 0);
         if (rc < 0) {
             zmq_msg_close(&msg_rma);
             free(saved_identity);
@@ -2129,7 +2210,7 @@ na_zmq_progress(struct na_zmq_class *priv)
 
         /* Read payload frame */
         zmq_msg_init(&msg_payload);
-        rc = zmq_msg_recv(&msg_payload, priv->zmq_socket, 0);
+        rc = zmq_msg_recv(&msg_payload, priv->router_socket, 0);
         if (rc < 0) {
             zmq_msg_close(&msg_payload);
             free(saved_identity);
@@ -2146,7 +2227,7 @@ na_zmq_progress(struct na_zmq_class *priv)
         /* Read source sockaddr frame (frame 4) */
         memset(&source_ss, 0, sizeof(source_ss));
         zmq_msg_init(&msg_source);
-        rc = zmq_msg_recv(&msg_source, priv->zmq_socket, 0);
+        rc = zmq_msg_recv(&msg_source, priv->router_socket, 0);
         if (rc >= 0) {
             size_t src_size = zmq_msg_size(&msg_source);
             if (src_size == sizeof(struct sockaddr_in) ||
@@ -2156,7 +2237,7 @@ na_zmq_progress(struct na_zmq_class *priv)
         }
         zmq_msg_close(&msg_source);
 
-        /* Store identity → addr mapping for routing responses back.
+        /* Store identity->addr mapping for routing responses back.
          * The source_ss (from frame 4) tells us the sender's actual address.
          * The saved_identity tells us the ZMQ routing token for that peer. */
         if (source_ss.ss_family != 0 && saved_identity != NULL) {
@@ -2166,55 +2247,100 @@ na_zmq_progress(struct na_zmq_class *priv)
         }
         free(saved_identity);
 
-        /* Create source addr for msg dispatch */
-        if (source_ss.ss_family != 0) {
-            source_addr = (struct na_zmq_addr *) calloc(1,
-                sizeof(*source_addr));
-            if (source_addr != NULL) {
-                memcpy(&source_addr->ss, &source_ss, sizeof(source_ss));
-                hg_atomic_init32(&source_addr->refcount, 1);
-                source_addr->is_self = false;
+        na_zmq_dispatch_message(priv, &hdr, &rma_hdr, &source_ss,
+            payload_data, payload_size);
+    }
+}
+
+/*---------------------------------------------------------------------------*/
+static void
+na_zmq_progress_dealer(struct na_zmq_class *priv,
+    struct na_zmq_peer *peer)
+{
+    zmq_msg_t msg_hdr, msg_rma, msg_payload;
+    int rc;
+
+    /* Drain all available messages from this DEALER socket.
+     * DEALER receives 4 frames (no identity prefix). */
+    for (;;) {
+        struct na_zmq_msg_hdr hdr;
+        struct na_zmq_rma_hdr rma_hdr;
+        struct sockaddr_storage source_ss;
+        void *payload_data = NULL;
+        size_t payload_size;
+        zmq_msg_t msg_source;
+
+        /* Read header frame */
+        zmq_msg_init(&msg_hdr);
+        rc = zmq_msg_recv(&msg_hdr, peer->dealer_socket, ZMQ_DONTWAIT);
+        if (rc < 0) {
+            zmq_msg_close(&msg_hdr);
+            break; /* No more messages */
+        }
+        if ((size_t) rc < sizeof(hdr)) {
+            zmq_msg_close(&msg_hdr);
+            continue;
+        }
+        memcpy(&hdr, zmq_msg_data(&msg_hdr), sizeof(hdr));
+        zmq_msg_close(&msg_hdr);
+
+        /* Read RMA header frame */
+        zmq_msg_init(&msg_rma);
+        rc = zmq_msg_recv(&msg_rma, peer->dealer_socket, 0);
+        if (rc < 0) {
+            zmq_msg_close(&msg_rma);
+            continue;
+        }
+        if (zmq_msg_size(&msg_rma) >= sizeof(rma_hdr))
+            memcpy(&rma_hdr, zmq_msg_data(&msg_rma), sizeof(rma_hdr));
+        zmq_msg_close(&msg_rma);
+
+        /* Read payload frame */
+        zmq_msg_init(&msg_payload);
+        rc = zmq_msg_recv(&msg_payload, peer->dealer_socket, 0);
+        if (rc < 0) {
+            zmq_msg_close(&msg_payload);
+            continue;
+        }
+        payload_size = zmq_msg_size(&msg_payload);
+        if (payload_size > 0) {
+            payload_data = malloc(payload_size);
+            if (payload_data != NULL)
+                memcpy(payload_data, zmq_msg_data(&msg_payload), payload_size);
+        }
+        zmq_msg_close(&msg_payload);
+
+        /* Read source sockaddr frame */
+        memset(&source_ss, 0, sizeof(source_ss));
+        zmq_msg_init(&msg_source);
+        rc = zmq_msg_recv(&msg_source, peer->dealer_socket, 0);
+        if (rc >= 0) {
+            size_t src_size = zmq_msg_size(&msg_source);
+            if (src_size == sizeof(struct sockaddr_in) ||
+                src_size == sizeof(struct sockaddr_in6)) {
+                memcpy(&source_ss, zmq_msg_data(&msg_source), src_size);
             }
         }
+        zmq_msg_close(&msg_source);
 
-        /* Dispatch based on message type */
-        switch (hdr.type) {
-        case NA_ZMQ_MSG_UNEXPECTED:
-            na_zmq_process_recv_unexpected(priv, source_addr,
-                hdr.tag, payload_data, payload_size);
-            payload_data = NULL; /* ownership transferred */
-            break;
+        na_zmq_dispatch_message(priv, &hdr, &rma_hdr, &source_ss,
+            payload_data, payload_size);
+    }
+}
 
-        case NA_ZMQ_MSG_EXPECTED:
-            na_zmq_process_recv_expected(priv, source_addr,
-                hdr.tag, hdr.dest_id, payload_data, payload_size);
-            payload_data = NULL;
-            break;
+/*---------------------------------------------------------------------------*/
+static na_return_t
+na_zmq_progress(struct na_zmq_class *priv)
+{
+    struct na_zmq_peer *peer;
 
-        case NA_ZMQ_MSG_RMA_PUT:
-            na_zmq_process_rma_put(priv, &rma_hdr,
-                payload_data, payload_size);
-            payload_data = NULL;
-            break;
+    /* Progress the ROUTER socket (receives from DEALER peers) */
+    na_zmq_progress_router(priv);
 
-        case NA_ZMQ_MSG_RMA_GET:
-            na_zmq_process_rma_get(priv, &rma_hdr, &source_ss);
-            break;
-
-        case NA_ZMQ_MSG_RMA_RESP:
-            na_zmq_process_rma_resp(priv, &rma_hdr,
-                payload_data, payload_size);
-            payload_data = NULL;
-            break;
-
-        default:
-            break;
-        }
-
-        free(payload_data);
-        if (source_addr != NULL &&
-            hg_atomic_decr32(&source_addr->refcount) == 0)
-            free(source_addr);
+    /* Progress each DEALER socket (receives from ROUTER peers) */
+    STAILQ_FOREACH(peer, &priv->peer_list, entry) {
+        if (peer->dealer_socket != NULL)
+            na_zmq_progress_dealer(priv, peer);
     }
 
     return NA_SUCCESS;
@@ -2222,15 +2348,12 @@ na_zmq_progress(struct na_zmq_class *priv)
 
 /*---------------------------------------------------------------------------*/
 static int
-na_zmq_poll_get_fd(na_class_t *na_class,
+na_zmq_poll_get_fd(na_class_t NA_UNUSED *na_class,
     na_context_t NA_UNUSED *context)
 {
-    struct na_zmq_class *priv = NA_ZMQ_CLASS(na_class);
-    int fd = -1;
-    size_t fd_size = sizeof(fd);
-
-    zmq_getsockopt(priv->zmq_socket, ZMQ_FD, &fd, &fd_size);
-    return fd;
+    /* Cannot expose a single FD for ROUTER + multiple DEALERs.
+     * Returning -1 forces Mercury to use poll_wait() instead. */
+    return -1;
 }
 
 /*---------------------------------------------------------------------------*/
@@ -2239,6 +2362,7 @@ na_zmq_poll_try_wait(na_class_t *na_class,
     na_context_t NA_UNUSED *context)
 {
     struct na_zmq_class *priv = NA_ZMQ_CLASS(na_class);
+    struct na_zmq_peer *peer;
     int events = 0;
     size_t events_size = sizeof(events);
 
@@ -2246,10 +2370,22 @@ na_zmq_poll_try_wait(na_class_t *na_class,
     if (!STAILQ_EMPTY(&priv->unexpected_msg_queue))
         return false;
 
-    /* Check ZMQ events (also re-arms the edge-triggered FD) */
-    zmq_getsockopt(priv->zmq_socket, ZMQ_EVENTS, &events, &events_size);
+    /* Check ROUTER socket events */
+    zmq_getsockopt(priv->router_socket, ZMQ_EVENTS, &events, &events_size);
     if (events & ZMQ_POLLIN)
         return false;
+
+    /* Check all DEALER sockets */
+    STAILQ_FOREACH(peer, &priv->peer_list, entry) {
+        if (peer->dealer_socket != NULL) {
+            events = 0;
+            events_size = sizeof(events);
+            zmq_getsockopt(peer->dealer_socket, ZMQ_EVENTS,
+                &events, &events_size);
+            if (events & ZMQ_POLLIN)
+                return false;
+        }
+    }
 
     return true;
 }
@@ -2277,36 +2413,69 @@ na_zmq_poll_wait(na_class_t *na_class, na_context_t NA_UNUSED *context,
     unsigned int timeout_ms, unsigned int *count_p)
 {
     struct na_zmq_class *priv = NA_ZMQ_CLASS(na_class);
-    int zmq_fd = -1;
-    size_t fd_size = sizeof(zmq_fd);
-    struct pollfd pfd;
-    int rc;
+    struct na_zmq_peer *peer;
+    struct pollfd pfds[64];
+    nfds_t nfds = 0;
+    int events, rc;
+    size_t events_size;
+    bool has_data = false;
 
-    zmq_getsockopt(priv->zmq_socket, ZMQ_FD, &zmq_fd, &fd_size);
-
-    /* Check ZMQ_EVENTS first to re-arm the edge-triggered FD */
+    /* Build pollfd array from ROUTER + all DEALER sockets.
+     * Also check ZMQ_EVENTS to re-arm edge-triggered FDs. */
     {
-        int events = 0;
-        size_t events_size = sizeof(events);
-        zmq_getsockopt(priv->zmq_socket, ZMQ_EVENTS, &events, &events_size);
-        if (events & ZMQ_POLLIN) {
-            /* Data available - process immediately */
-            hg_thread_mutex_lock(&priv->socket_lock);
-            na_zmq_progress(priv);
-            hg_thread_mutex_unlock(&priv->socket_lock);
+        int fd = -1;
+        size_t fd_size = sizeof(fd);
 
-            if (count_p != NULL)
-                *count_p = 0;
-            return NA_SUCCESS;
+        /* ROUTER socket */
+        zmq_getsockopt(priv->router_socket, ZMQ_FD, &fd, &fd_size);
+        events = 0;
+        events_size = sizeof(events);
+        zmq_getsockopt(priv->router_socket, ZMQ_EVENTS,
+            &events, &events_size);
+        if (events & ZMQ_POLLIN)
+            has_data = true;
+        if (fd >= 0 && nfds < 64) {
+            pfds[nfds].fd = fd;
+            pfds[nfds].events = POLLIN;
+            pfds[nfds].revents = 0;
+            nfds++;
+        }
+
+        /* DEALER sockets */
+        STAILQ_FOREACH(peer, &priv->peer_list, entry) {
+            if (peer->dealer_socket != NULL && nfds < 64) {
+                fd = -1;
+                fd_size = sizeof(fd);
+                zmq_getsockopt(peer->dealer_socket, ZMQ_FD, &fd, &fd_size);
+                events = 0;
+                events_size = sizeof(events);
+                zmq_getsockopt(peer->dealer_socket, ZMQ_EVENTS,
+                    &events, &events_size);
+                if (events & ZMQ_POLLIN)
+                    has_data = true;
+                if (fd >= 0) {
+                    pfds[nfds].fd = fd;
+                    pfds[nfds].events = POLLIN;
+                    pfds[nfds].revents = 0;
+                    nfds++;
+                }
+            }
         }
     }
 
-    /* Wait for activity on the ZMQ FD */
-    pfd.fd = zmq_fd;
-    pfd.events = POLLIN;
-    pfd.revents = 0;
+    if (has_data) {
+        /* Data available - process immediately */
+        hg_thread_mutex_lock(&priv->socket_lock);
+        na_zmq_progress(priv);
+        hg_thread_mutex_unlock(&priv->socket_lock);
 
-    rc = poll(&pfd, 1, (int) timeout_ms);
+        if (count_p != NULL)
+            *count_p = 0;
+        return NA_SUCCESS;
+    }
+
+    /* Wait for activity on any socket FD */
+    rc = poll(pfds, nfds, (int) timeout_ms);
     if (rc < 0 && errno != EINTR)
         return NA_IO_ERROR;
 

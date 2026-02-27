@@ -416,6 +416,8 @@ set(NA_PUBLIC_HEADERS
   ${CMAKE_CURRENT_BINARY_DIR}/na_config.h
   ${CMAKE_CURRENT_SOURCE_DIR}/na.h
   ${CMAKE_CURRENT_SOURCE_DIR}/na_types.h
+  ${CMAKE_CURRENT_SOURCE_DIR}/na_plugin.h
+  ${CMAKE_CURRENT_SOURCE_DIR}/na_error.h
 )
 
 if(NA_HAS_MPI)
@@ -436,8 +438,6 @@ endif()
 # Specify project private header files
 #------------------------------------------------------------------------------
 set(NA_PRIVATE_HEADERS
-  ${CMAKE_CURRENT_SOURCE_DIR}/na_error.h
-  ${CMAKE_CURRENT_SOURCE_DIR}/na_plugin.h
 )
 
 if(NOT WIN32)
@@ -470,8 +470,8 @@ target_include_directories(na
          PRIVATE ${NA_INT_INCLUDE_DEPENDENCIES}
 )
 target_link_libraries(na
-  PUBLIC  ${NA_EXT_LIB_DEPENDENCIES}
-  PRIVATE ${NA_INT_LIB_DEPENDENCIES} mercury_util
+  PUBLIC  ${NA_EXT_LIB_DEPENDENCIES} mercury_util
+  PRIVATE ${NA_INT_LIB_DEPENDENCIES}
 )
 mercury_set_lib_options(na "na" ${NA_LIBTYPE} ${PROJECT_NAME})
 if(MERCURY_ENABLE_COVERAGE)

@@ -75,12 +75,11 @@
 /* Dynamically loaded plugins */
 #cmakedefine NA_HAS_DYNAMIC_PLUGINS
 #ifdef NA_HAS_DYNAMIC_PLUGINS
-#    define NA_PLUGIN            HG_ATTR_ABI_EXPORT /* plugins always export */
-#    define NA_PLUGIN_VISIBILITY NA_PUBLIC
+#    define NA_PLUGIN HG_ATTR_ABI_EXPORT /* plugins always export */
 #else
 #    define NA_PLUGIN
-#    define NA_PLUGIN_VISIBILITY NA_PRIVATE
 #endif
+#define NA_PLUGIN_VISIBILITY NA_PUBLIC
 #cmakedefine NA_PLUGIN_RELATIVE_PATH "@NA_PLUGIN_RELATIVE_PATH@"
 
 /* Build Options */

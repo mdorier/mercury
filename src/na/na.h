@@ -17,6 +17,9 @@
 
 /* See na_types.h */
 
+/* Forward declaration for plugin registration API */
+struct na_class_ops;
+
 /*****************/
 /* Public Macros */
 /*****************/
@@ -62,6 +65,20 @@ NA_Get_protocol_info(
  */
 NA_PUBLIC void
 NA_Free_protocol_info(struct na_protocol_info *na_protocol_info);
+
+/**
+ * Register a custom NA plugin at runtime. The plugin will be considered during
+ * NA_Initialize() and NA_Get_protocol_info() lookups after static plugins but
+ * before dynamic plugins. Must be called before NA_Initialize().
+ * Not thread-safe — intended for use during program setup.
+ *
+ * \param ops [IN]              pointer to plugin class ops (must have
+ *                              class_name and check_protocol defined)
+ *
+ * \return NA_SUCCESS or corresponding NA error code
+ */
+NA_PUBLIC na_return_t
+NA_Register_plugin(const struct na_class_ops *ops);
 
 /**
  * Initialize the NA layer.

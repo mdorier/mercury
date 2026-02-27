@@ -211,6 +211,11 @@ static const struct na_class_ops *const na_plugin_static_g[] = {
 static struct na_plugin_entry *na_plugin_dynamic_g = NULL;
 #endif
 
+/* Registered plugin ops table (runtime-registered plugins) */
+static const struct na_class_ops
+    *na_plugin_registered_g[NA_PLUGIN_MAX + 1] = {NULL};
+static int na_plugin_registered_count_g = 0;
+
 /* Return code string table */
 #define X(a) #a,
 static const char *const na_return_name_g[] = {NA_RETURN_VALUES};
@@ -754,6 +759,26 @@ NA_Get_protocol_info(
         na_plugin_static_g, class_name, na_info, &na_protocol_info);
     NA_CHECK_SUBSYS_NA_ERROR(cls, error, ret, "Could not check static plugins");
 
+    /* Check list of registered plugins */
+    if (na_plugin_registered_count_g > 0) {
+        struct na_protocol_info *registered_protocol_info = NULL;
+
+        ret = na_plugin_get_protocol_info(
+            na_plugin_registered_g, class_name, na_info,
+            &registered_protocol_info);
+        NA_CHECK_SUBSYS_NA_ERROR(
+            cls, error, ret, "Could not check registered plugins");
+        if (registered_protocol_info != NULL) {
+            struct na_protocol_info *tail = NULL;
+
+            for (tail = registered_protocol_info; tail->next != NULL;
+                tail = tail->next)
+                /* nothing */;
+            tail->next = na_protocol_info;
+            na_protocol_info = registered_protocol_info;
+        }
+    }
+
     /* Check list of dynamic plugins */
 #ifdef NA_HAS_DYNAMIC_PLUGINS
     if (na_plugin_dynamic_g != NULL) {
@@ -811,6 +836,40 @@ NA_Free_protocol_info(struct na_protocol_info *na_protocol_info)
         na_protocol_info = na_protocol_info->next;
         na_protocol_info_free(tmp);
     }
+}
+
+/*---------------------------------------------------------------------------*/
+na_return_t
+NA_Register_plugin(const struct na_class_ops *ops)
+{
+    na_return_t ret;
+    int i;
+
+    NA_CHECK_SUBSYS_ERROR(
+        cls, ops == NULL, error, ret, NA_INVALID_ARG, "NULL ops");
+    NA_CHECK_SUBSYS_ERROR(cls, ops->class_name == NULL, error, ret,
+        NA_INVALID_ARG, "NULL class_name in ops");
+    NA_CHECK_SUBSYS_ERROR(cls, ops->check_protocol == NULL, error, ret,
+        NA_INVALID_ARG, "NULL check_protocol in ops");
+    NA_CHECK_SUBSYS_ERROR(cls, na_plugin_registered_count_g >= NA_PLUGIN_MAX,
+        error, ret, NA_OVERFLOW, "Maximum number of registered plugins reached");
+
+    /* Check for duplicates */
+    for (i = 0; i < na_plugin_registered_count_g; i++) {
+        NA_CHECK_SUBSYS_ERROR(cls, na_plugin_registered_g[i] == ops, error, ret,
+            NA_EXIST, "Plugin already registered");
+    }
+
+    na_plugin_registered_g[na_plugin_registered_count_g++] = ops;
+    na_plugin_registered_g[na_plugin_registered_count_g] = NULL;
+
+    NA_LOG_SUBSYS_DEBUG(
+        cls, "Registered plugin: %s", ops->class_name);
+
+    return NA_SUCCESS;
+
+error:
+    return ret;
 }
 
 /*---------------------------------------------------------------------------*/
@@ -892,6 +951,14 @@ NA_Initialize_opt2(const char *info_string, bool listen, unsigned int version,
     ret = na_plugin_check_protocol(
         na_plugin_static_g, class_name, na_info->protocol_name, &ops);
     NA_CHECK_SUBSYS_NA_ERROR(cls, error, ret, "Could not check static plugins");
+
+    /* Check list of registered plugins */
+    if (ops == NULL && na_plugin_registered_count_g > 0) {
+        ret = na_plugin_check_protocol(na_plugin_registered_g, class_name,
+            na_info->protocol_name, &ops);
+        NA_CHECK_SUBSYS_NA_ERROR(
+            cls, error, ret, "Could not check registered plugins");
+    }
 
 #ifdef NA_HAS_DYNAMIC_PLUGINS
     if (ops == NULL) {
@@ -991,6 +1058,10 @@ NA_Cleanup(void)
         i++, ops = na_plugin_static_g[i])
         if (ops->cleanup)
             ops->cleanup();
+
+    for (i = 0; i < na_plugin_registered_count_g; i++)
+        if (na_plugin_registered_g[i]->cleanup)
+            na_plugin_registered_g[i]->cleanup();
 }
 
 /*---------------------------------------------------------------------------*/
